@@ -1,11 +1,9 @@
 package org.example.test1.entity;
 
-import com.baomidou.mybatisplus.annotation.TableName;
-import lombok.Data;
+
 import java.time.LocalDate;
 
-@Data
-@TableName("student_grade")
+
 public class StudentGrade {
     private Long id;
     private String studentId;
@@ -19,4 +17,63 @@ public class StudentGrade {
 
     // 记录日期
     private LocalDate recordDate;
+
+    public Long getId() {
+        return id;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    public String getStudentId() {
+        return studentId;
+    }
+
+    public void setStudentId(String studentId) {
+        this.studentId = studentId;
+    }
+
+    public String getCourseId() {
+        return courseId;
+    }
+
+    public void setCourseId(String courseId) {
+        this.courseId = courseId;
+    }
+
+    public Double getScore() {
+        return score;
+    }
+
+    public void setScore(Double score) {
+        this.score = score;
+    }
+
+    public Integer getTimeStep() {
+        return timeStep;
+    }
+
+    public void setTimeStep(Integer timeStep) {
+        this.timeStep = timeStep;
+    }
+
+    public LocalDate getRecordDate() {
+        return recordDate;
+    }
+
+    public void setRecordDate(LocalDate recordDate) {
+        this.recordDate = recordDate;
+    }
+
+    public StudentGrade(Long id, String studentId, String courseId, Double score, Integer timeStep, LocalDate recordDate) {
+        this.id = id;
+        this.studentId = studentId;
+        this.courseId = courseId;
+        this.score = score;
+        this.timeStep = timeStep;
+        this.recordDate = recordDate;
+    }
+    public StudentGrade() {
+    }
 }

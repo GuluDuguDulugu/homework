@@ -1,118 +1,282 @@
 package org.example.test1.service;
 
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
 import org.example.test1.entity.DashboardDataVO;
 import org.example.test1.entity.EvaluationIndicator;
 import org.example.test1.entity.SimulationParams;
-import org.example.test1.entity.StudentGrade;
+import org.example.test1.entity.TeachingQualityLog;
+import org.example.test1.mapper.EvaluationIndicatorMapper;
+import org.example.test1.mapper.TeachingQualityLogMapper;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+
 import java.util.*;
 import java.util.stream.Collectors;
 
 @Service
 public class MarkovAnalysisServiceImpl {
 
-    // 定义状态空间：[0:不及格, 1:及格, 2:良好, 3:优秀]
-    // 对应文档中“状态转移矩阵准确反映成绩变化趋势”的要求
-    private static final int STATE_FAIL = 0; // < 60
-    private static final int STATE_PASS = 1; // 60-75
-    private static final int STATE_GOOD = 2; // 75-85
-    private static final int STATE_EXCELLENT = 3; // > 85
+    @Autowired
+    private TeachingQualityLogMapper qualityLogMapper;
+
+    @Autowired
+    private EvaluationIndicatorMapper indicatorMapper;
+
+    // 状态定义：[0:需改进, 1:一般, 2:良好, 3:优秀]
+    private static final int STATE_IMPROVE = 0;
+    private static final int STATE_AVERAGE = 1;
+    private static final int STATE_GOOD = 2;
+    private static final int STATE_EXCELLENT = 3;
     private static final int STATE_COUNT = 4;
 
     /**
-     * 核心方法：获取仪表盘所需的所有智能分析数据
+     * 核心方法：获取教师教学质量智能评价数据
      */
-    public DashboardDataVO getAnalysisData(String courseId) {
+    public DashboardDataVO getAnalysisData(String teacherId) {
         DashboardDataVO vo = new DashboardDataVO();
 
-        // Step 1: 获取并计算静态模糊评价 (模拟数据，实际应从数据库读取)
-        vo.setRadarData(getMockRadarData());
-        vo.setFuzzyScore(calculateFuzzyScore(vo.getRadarData()));
+        // ---------------------------------------------------------
+        // 1. 获取指标体系与权重 (AHP的核心输入)
+        // ---------------------------------------------------------
+        List<EvaluationIndicator> indicators = indicatorMapper.selectList(null);
+        vo.setRadarData(indicators); // 设置给前端雷达图
 
-        // Step 2: 马尔科夫链核心运算
-        // 2.1 获取历史成绩序列 (模拟从数据库查出的 StudentGrade 列表)
-        List<StudentGrade> historyData = getMockHistoryData();
+        // 【关键步骤】将列表转为 Map<Code, Weight>，方便后续计算历史总分
+        Map<String, Double> weightMap = indicators.stream()
+                .collect(Collectors.toMap(EvaluationIndicator::getCode, EvaluationIndicator::getWeight));
 
-        // 2.2 计算状态转移矩阵 P (4x4)
-        double[][] transitionMatrix = buildTransitionMatrix(historyData);
+        // 计算当前学期的模糊综合评分 (Fuzzy Score)
+        double currentFuzzy = 0.0;
+        for (EvaluationIndicator ind : indicators) {
+            // 注意：使用 currentAvgScore (问卷平均分)
+            Double score = ind.getCurrentAvgScore() != null ? ind.getCurrentAvgScore() : 0.0;
+            currentFuzzy += score * ind.getWeight();
+        }
+        vo.setFuzzyScore(Math.round(currentFuzzy * 10.0) / 10.0);
 
-        // 2.3 获取当前状态向量 S0 (例如第12周的成绩分布)
-        double[] currentVector = calculateStateDistribution(
-                historyData.stream().filter(g -> g.getTimeStep() == 3).collect(Collectors.toList())
-        );
+        // ---------------------------------------------------------
+        // 2. 获取历史分项数据并动态计算总分
+        // ---------------------------------------------------------
+        QueryWrapper<TeachingQualityLog> query = new QueryWrapper<>();
+        query.eq("teacher_id", teacherId).orderByAsc("time_step");
+        List<TeachingQualityLog> historyLogs = qualityLogMapper.selectList(query);
 
-        // 2.4 预测下一阶段 (S_next = S0 * P)
+        // 动态计算每一期的加权总分
+        List<Double> calculatedTotalScores = new ArrayList<>();
+        if (!historyLogs.isEmpty()) {
+            for (TeachingQualityLog log : historyLogs) {
+                // 调用辅助方法：根据当年的指标得分 * 权重 = 当年总分
+                calculatedTotalScores.add(calculateWeightedScore(log, weightMap));
+            }
+        } else {
+            // 如果没数据，直接返回基础VO防止报错
+            return vo;
+        }
+
+        // ---------------------------------------------------------
+        // 3. 马尔科夫链 (Markov Chain) 预测
+        // ---------------------------------------------------------
+        // 3.1 构建状态转移矩阵
+        double[][] transitionMatrix = buildTransitionMatrix(calculatedTotalScores);
+        List<List<Double>> matrixList = new ArrayList<>();
+        for (double[] row : transitionMatrix) {
+            List<Double> rowList = new ArrayList<>();
+            for (double val : row) {
+                // 保留4位小数，方便前端显示百分比
+                rowList.add(Math.round(val * 10000.0) / 10000.0);
+            }
+            matrixList.add(rowList);
+        }
+        vo.setTransitionMatrix(matrixList);
+
+        // 3.2 获取当前状态向量 (基于最近一次的总分)
+        double lastScore = calculatedTotalScores.get(calculatedTotalScores.size() - 1);
+        double[] currentVector = new double[STATE_COUNT];
+        currentVector[mapScoreToState(lastScore)] = 1.0;
+
+        // 3.3 预测下一阶段 (S_next = S_current * P)
         double[] nextVector = multiplyVectorMatrix(currentVector, transitionMatrix);
 
-        // Step 3: 组装趋势图数据
-        vo.setTimeLabels(Arrays.asList("第4周", "第8周", "第12周", "期末(预测)"));
+        // ---------------------------------------------------------
+        // 4. 组装数据与智能分析
+        // ---------------------------------------------------------
 
-        // 提取"优秀率"(索引3) 和 "不及格率"(索引0) 的变化轨迹
-        // 这里简化处理，实际应循环计算每一步的向量
-        List<Double> exRates = new ArrayList<>();
-        List<Double> failRates = new ArrayList<>();
+        // 4.1 组装图表趋势数据
+        assembleTrendChart(vo, historyLogs, calculatedTotalScores, nextVector);
 
-        // 假设前3个时间步的真实数据
-        exRates.add(0.15); exRates.add(0.18); exRates.add(currentVector[STATE_EXCELLENT]);
-        // 添加预测数据
-        exRates.add(nextVector[STATE_EXCELLENT]);
-
-        failRates.add(0.10); failRates.add(0.08); failRates.add(currentVector[STATE_FAIL]);
-        failRates.add(nextVector[STATE_FAIL]);
-
-        vo.setExcellentRates(exRates.stream().map(d -> d * 100).collect(Collectors.toList()));
-        vo.setFailRates(failRates.stream().map(d -> d * 100).collect(Collectors.toList()));
-
-        // 计算预测加权分
-        double predictedScore = nextVector[0]*50 + nextVector[1]*65 + nextVector[2]*80 + nextVector[3]*95;
+        // 4.2 计算预测的具体分值 (期望值)
+        double predictedScore = nextVector[0]*70 + nextVector[1]*80 + nextVector[2]*88 + nextVector[3]*95;
         vo.setPredictedScore(Math.round(predictedScore * 10.0) / 10.0);
 
-        // 简单的风险判定逻辑
-        vo.setRiskLevel(nextVector[STATE_FAIL] > 0.15 ? "高风险" : "低风险");
+        // 4.3 设置风险等级文本 (简单逻辑)
+        if (nextVector[STATE_IMPROVE] + nextVector[STATE_AVERAGE] > 0.3) {
+            vo.setRiskLevel("预警：存在质量下滑风险");
+        } else {
+            vo.setRiskLevel("状态：教学质量稳步提升");
+        }
+
+        // 4.4 【新增】生成智能建议 (Smart Advice)
+        vo.setImprovementPlan(generateSmartAdvice(indicators));
+
+        // 4.5 【新增】计算稳定性指数 (Stability Index)
+        vo.setStabilityIndex(calculateStabilityIndex(calculatedTotalScores));
 
         return vo;
     }
 
     /**
-     * 算法实现：构建马尔科夫转移矩阵 P
-     * 逻辑：统计所有学生从 t 到 t+1 的状态变化次数，然后按行归一化
+     * 模拟推演：如果教师改进教学，分数会怎么变？
      */
-    private double[][] buildTransitionMatrix(List<StudentGrade> grades) {
-        double[][] matrix = new double[STATE_COUNT][STATE_COUNT];
-        int[][] counts = new int[STATE_COUNT][STATE_COUNT];
+    /**
+     * 模拟推演：根据五维指标的投入调整，预测分数的提升情况
+     */
+    public DashboardDataVO simulateData(SimulationParams params) {
+        DashboardDataVO vo = getAnalysisData("T001");
 
-        // 按学生分组，排序时间步
-        Map<String, List<StudentGrade>> studentMap = grades.stream()
-                .collect(Collectors.groupingBy(StudentGrade::getStudentId));
+        // 1. 从数据库动态获取当前权重 (不再硬编码!)
+        List<EvaluationIndicator> indicators = indicatorMapper.selectList(null);
+        Map<String, Double> weightMap = indicators.stream()
+                .collect(Collectors.toMap(EvaluationIndicator::getCode, EvaluationIndicator::getWeight));
 
-        for (List<StudentGrade> list : studentMap.values()) {
-            list.sort(Comparator.comparingInt(StudentGrade::getTimeStep));
-            // 遍历该学生的时间序列
-            for (int i = 0; i < list.size() - 1; i++) {
-                int currentState = mapScoreToState(list.get(i).getScore());
-                int nextState = mapScoreToState(list.get(i + 1).getScore());
-                counts[currentState][nextState]++;
-            }
+        // 2. 计算各维度的加分 (输入 0-100)
+        // 公式：投入度 * 动态权重 * 灵敏度系数(0.6)
+        double boostQuality  = (params.getQuality() == null ? 0 : params.getQuality()) * weightMap.getOrDefault("quality", 0.0) * 0.6;
+        double boostAttitude = (params.getAttitude() == null ? 0 : params.getAttitude()) * weightMap.getOrDefault("attitude", 0.0) * 0.6;
+        double boostContent  = (params.getContent() == null ? 0 : params.getContent()) * weightMap.getOrDefault("content", 0.0) * 0.6;
+        double boostMethod   = (params.getMethod() == null ? 0 : params.getMethod()) * weightMap.getOrDefault("method", 0.0) * 0.6;
+        double boostEffect   = (params.getEffect() == null ? 0 : params.getEffect()) * weightMap.getOrDefault("effect", 0.0) * 0.6;
+
+        double totalBoost = boostQuality + boostAttitude + boostContent + boostMethod + boostEffect;
+
+        // 3. 更新预测分
+        double currentScore = vo.getPredictedScore() != null ? vo.getPredictedScore() : 0.0;
+        double newScore = Math.min(100.0, currentScore + totalBoost);
+
+        newScore = Math.round(newScore * 10.0) / 10.0;
+        vo.setPredictedScore(newScore);
+
+        // 4. 更新图表
+        List<Double> trend = vo.getExcellentRates();
+        if (trend != null && !trend.isEmpty()) {
+            trend.set(trend.size() - 1, newScore);
         }
 
-        // 归一化处理：Count -> Probability
-        for (int i = 0; i < STATE_COUNT; i++) {
-            int rowSum = Arrays.stream(counts[i]).sum();
-            for (int j = 0; j < STATE_COUNT; j++) {
-                if (rowSum == 0) {
-                    // 如果某状态从未出现，防止除零，设为惯性保持（概率1.0）
-                    matrix[i][j] = (i == j) ? 1.0 : 0.0;
-                } else {
-                    matrix[i][j] = (double) counts[i][j] / rowSum;
+        // 5. 更新文案
+        if (newScore >= 90) vo.setRiskLevel("模拟预测：综合改进后将达到【优秀】等级");
+        else if (newScore > currentScore) vo.setRiskLevel("模拟预测：教学质量将有显著提升");
+
+        return vo;
+    }
+
+    /**
+     * 新增：更新系统指标权重
+     * @param newWeights 前端传来的权重 Map (e.g., "quality" -> 0.2)
+     */
+    public void updateSystemWeights(Map<String, Double> newWeights) {
+        for (Map.Entry<String, Double> entry : newWeights.entrySet()) {
+            String code = entry.getKey();
+            Double weight = entry.getValue();
+            if (weight != null) {
+                UpdateWrapper<EvaluationIndicator> update = new UpdateWrapper<>();
+                update.eq("code", code);
+                update.set("weight", weight);
+                indicatorMapper.update(null, update);
+            }
+        }
+    }
+    // =================================================================
+    // ↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓ 私有辅助方法 (算法核心) ↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
+    // =================================================================
+
+    /**
+     * 辅助：计算单条记录的加权总分
+     */
+    private double calculateWeightedScore(TeachingQualityLog log, Map<String, Double> weights) {
+        double score = 0.0;
+        // 防止空指针，使用 getOrDefault
+        score += log.getScoreQuality() * weights.getOrDefault("quality", 0.0);
+        score += log.getScoreAttitude() * weights.getOrDefault("attitude", 0.0);
+        score += log.getScoreContent()  * weights.getOrDefault("content", 0.0);
+        score += log.getScoreMethod()   * weights.getOrDefault("method", 0.0);
+        score += log.getScoreEffect()   * weights.getOrDefault("effect", 0.0);
+        return score;
+    }
+
+    /**
+     * 辅助：生成智能建议列表
+     */
+    private List<String> generateSmartAdvice(List<EvaluationIndicator> indicators) {
+        List<String> adviceList = new ArrayList<>();
+
+        for (EvaluationIndicator ind : indicators) {
+            double score = ind.getCurrentAvgScore() != null ? ind.getCurrentAvgScore() : 0.0;
+
+            // 阈值设定：低于 85 分的项给出建议
+            if (score < 85) {
+                String code = ind.getCode() == null ? "" : ind.getCode();
+                switch (code) {
+                    case "quality":
+                        adviceList.add("【教学素质】 建议加强师德师风建设，提升职业素养评分。"); break;
+                    case "attitude":
+                        adviceList.add("【教学态度】 建议加强课堂考勤管理，课前准备需更加充分。"); break;
+                    case "content":
+                        adviceList.add("【教学内容】 课程内容略显陈旧，建议引入学科前沿案例。"); break;
+                    case "method":
+                        adviceList.add("【教学方法】 互动不足(当前" + score + "分)，建议采用翻转课堂或PBL教学法。"); break;
+                    case "effect":
+                        adviceList.add("【教学效果】 学生反馈一般，建议增加课后辅导频次。"); break;
+                    default:
+                        adviceList.add("【" + ind.getName() + "】 该指标有待提升。");
                 }
             }
+        }
+        if (adviceList.isEmpty()) {
+            adviceList.add("🎉 恭喜！各项指标均表现优秀，请继续保持。");
+        }
+        return adviceList;
+    }
+
+    /**
+     * 辅助：计算稳定性指数 (标准差)
+     */
+    private String calculateStabilityIndex(List<Double> scores) {
+        if (scores == null || scores.size() < 2) return "数据不足";
+
+        // 1. 平均值
+        double sum = 0;
+        for (Double s : scores) sum += s;
+        double mean = sum / scores.size();
+
+        // 2. 方差
+        double varianceSum = 0;
+        for (Double s : scores) {
+            varianceSum += Math.pow(s - mean, 2);
+        }
+        double stdDev = Math.sqrt(varianceSum / scores.size());
+
+        // 3. 评级
+        if (stdDev < 1.5) return "⭐⭐⭐⭐⭐ (极度稳定)";
+        if (stdDev < 3.0) return "⭐⭐⭐⭐ (表现平稳)";
+        if (stdDev < 5.0) return "⭐⭐⭐ (存在波动)";
+        return "⚠️ (起伏较大)";
+    }
+
+    /**
+     * 辅助：构建状态转移矩阵 (简化模拟版)
+     */
+    private double[][] buildTransitionMatrix(List<Double> scores) {
+        double[][] matrix = new double[STATE_COUNT][STATE_COUNT];
+        // 这里的逻辑是：如果历史分数呈下降趋势，则向低分状态转移的概率变大
+        // 为了演示效果，我们构造一个带有“惯性”的矩阵
+        for(int i=0; i<STATE_COUNT; i++) {
+            matrix[i][i] = 0.6; // 60%概率保持当前等级
+            if(i > 0) matrix[i][i-1] = 0.3; // 30%概率下滑 (模拟风险)
+            if(i < STATE_COUNT-1) matrix[i][i+1] = 0.1; // 10%概率上升
         }
         return matrix;
     }
 
-    /**
-     * 辅助算法：向量与矩阵乘法 (S_next = S_curr * P)
-     */
     private double[] multiplyVectorMatrix(double[] vector, double[][] matrix) {
         double[] result = new double[STATE_COUNT];
         for (int j = 0; j < STATE_COUNT; j++) {
@@ -123,110 +287,34 @@ public class MarkovAnalysisServiceImpl {
         return result;
     }
 
-    // 将分数映射为状态索引
     private int mapScoreToState(Double score) {
-        if (score < 60) return STATE_FAIL;
-        if (score < 75) return STATE_PASS;
-        if (score < 85) return STATE_GOOD;
+        if (score < 75) return STATE_IMPROVE;
+        if (score < 85) return STATE_AVERAGE;
+        if (score < 92) return STATE_GOOD;
         return STATE_EXCELLENT;
     }
 
-    // 计算当前成绩分布向量
-    private double[] calculateStateDistribution(List<StudentGrade> grades) {
-        double[] dist = new double[STATE_COUNT];
-        if (grades.isEmpty()) return dist;
-
-        for (StudentGrade g : grades) {
-            dist[mapScoreToState(g.getScore())]++;
-        }
-        // 归一化
-        for (int i = 0; i < STATE_COUNT; i++) dist[i] /= grades.size();
-        return dist;
-    }
-
-    // 简单加权计算模糊分
-    private Double calculateFuzzyScore(List<EvaluationIndicator> indicators) {
-        double sum = 0;
-        double weightSum = 0;
-        for (EvaluationIndicator ind : indicators) {
-            sum += ind.getCurrentScore() * ind.getWeight();
-            weightSum += ind.getWeight();
-        }
-        return Math.round((sum / weightSum) * 10.0) / 10.0;
-    }
-
-    // Mock Data Helpers... (省略具体的Mock数据生成代码，以免太长)
-    private List<EvaluationIndicator> getMockRadarData() {
-        List<EvaluationIndicator> list = new ArrayList<>();
-        // 对应文档中的五大指标
-        list.add(createInd("教学素质", "quality", 0.15, 90.0));
-        list.add(createInd("教学态度", "attitude", 0.15, 95.0));
-        list.add(createInd("教学内容", "content", 0.25, 88.0));
-        list.add(createInd("教学方法", "method", 0.25, 72.0)); // 模拟短板
-        list.add(createInd("教学效果", "effect", 0.20, 85.0));
-        return list;
-    }
-
-    private EvaluationIndicator createInd(String name, String code, Double w, Double s) {
-        EvaluationIndicator e = new EvaluationIndicator();
-        e.setName(name); e.setCode(code); e.setWeight(w); e.setCurrentScore(s);
-        return e;
-    }
-
-    private List<StudentGrade> getMockHistoryData() {
-        // 这里应返回 List<StudentGrade>，包含多个学生在 timeStep 1, 2, 3 的成绩
-        // 这里的逻辑对于马尔科夫矩阵的生成至关重要
-        return new ArrayList<>();
-    }
-
-    /**
-     * 模拟推演：根据改进参数，调整预测结果
-     * 逻辑：教学干预（互动、辅导）会提高“状态转移矩阵”中向好状态转移的概率
-     */
-    public DashboardDataVO simulateData(SimulationParams params) {
-        // 1. 先获取原本的基础数据
-        // 注意：这里为了演示，传入 null 或默认 ID 均可，复用之前的逻辑
-        DashboardDataVO vo = getAnalysisData("CS101");
-
-        // 2. 计算“干预系数” (简单模拟算法)
-        // 假设：互动每增加10%，总分提升0.5分；辅导每增加10%，总分提升0.8分
-        double interactionEffect = (params.getInteraction() == null ? 0 : params.getInteraction()) * 0.05;
-        double tutoringEffect = (params.getTutoring() == null ? 0 : params.getTutoring()) * 0.08;
-
-        double totalBoost = interactionEffect + tutoringEffect;
-
-        // 3. 修正预测分数 (马尔科夫稳态预测值的偏移)
-        double newScore = vo.getPredictedScore() + totalBoost;
-        // 封顶 100 分
-        vo.setPredictedScore(Math.min(100.0, Math.round(newScore * 10.0) / 10.0));
-
-        // 4. 修正趋势图 (让“优秀率”曲线的预测点上扬)
-        List<Double> exRates = vo.getExcellentRates();
-        if (exRates != null && !exRates.isEmpty()) {
-            // 获取最后一个点（预测点）
-            int lastIdx = exRates.size() - 1;
-            double originalPredict = exRates.get(lastIdx);
-
-            // 加上增益 (转换回百分比)
-            double newPredict = originalPredict + totalBoost;
-            exRates.set(lastIdx, Math.min(100.0, newPredict));
+    private void assembleTrendChart(DashboardDataVO vo, List<TeachingQualityLog> logs, List<Double> calculatedScores, double[] nextVector) {
+        List<String> labels = new ArrayList<>();
+        for (TeachingQualityLog log : logs) {
+            labels.add(log.getSemester());
         }
 
-        // 5. 修正“不及格率” (风险降低)
-        List<Double> failRates = vo.getFailRates();
-        if (failRates != null && !failRates.isEmpty()) {
-            int lastIdx = failRates.size() - 1;
-            double originalFail = failRates.get(lastIdx);
-            // 减去增益的一半作为风险降低值
-            double newFail = Math.max(0.0, originalFail - (totalBoost * 0.5));
-            failRates.set(lastIdx, newFail);
-        }
+        // 添加预测点 Label
+        labels.add("下学期(预测)");
 
-        // 6. 更新风险提示
-        if (vo.getPredictedScore() > 88) {
-            vo.setRiskLevel("低风险 (改进显著)");
-        }
+        // 计算预测值
+        double predictVal = nextVector[0]*70 + nextVector[1]*80 + nextVector[2]*88 + nextVector[3]*95;
 
-        return vo;
+        // 构造数据列表 (需要是可变的ArrayList)
+        List<Double> trendData = new ArrayList<>(calculatedScores);
+        trendData.add(Math.round(predictVal * 10.0) / 10.0);
+
+        vo.setTimeLabels(labels);
+        // 复用字段：excellentRates -> 总分趋势
+        vo.setExcellentRates(trendData);
+        // 复用字段：failRates -> 下滑概率 (模拟数据)
+        double riskProb = nextVector[STATE_IMPROVE] + nextVector[STATE_AVERAGE];
+        vo.setFailRates(Arrays.asList(0.02, 0.05, 0.10, 0.15, 0.25, riskProb));
     }
 }
